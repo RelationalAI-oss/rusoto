@@ -3,14 +3,16 @@ use chrono::Duration;
 
 use rusoto_core;
 
-use rusoto_core::{AwsCredentials, CredentialsError, ProvideAwsCredentials};
+use rusoto_core::{AwsCredentials, CredentialsError,
+    ProvideAwsCredentials, DispatchSignedRequest};
 use ::{AssumeRoleRequest, AssumeRoleResponse, AssumeRoleError,
-       AssumeRoleWithSAMLRequest, AssumeRoleWithSAMLResponse, AssumeRoleWithSAMLError,
-       AssumeRoleWithWebIdentityRequest, AssumeRoleWithWebIdentityResponse, AssumeRoleWithWebIdentityError,
-       DecodeAuthorizationMessageRequest, DecodeAuthorizationMessageResponse, DecodeAuthorizationMessageError,
-       GetCallerIdentityRequest, GetCallerIdentityResponse, GetCallerIdentityError,
-       GetFederationTokenRequest, GetFederationTokenResponse, GetFederationTokenError,
-       GetSessionTokenRequest, GetSessionTokenResponse, GetSessionTokenError, Sts};
+    AssumeRoleWithSAMLRequest, AssumeRoleWithSAMLResponse, AssumeRoleWithSAMLError,
+    AssumeRoleWithWebIdentityRequest, AssumeRoleWithWebIdentityResponse, AssumeRoleWithWebIdentityError,
+    DecodeAuthorizationMessageRequest, DecodeAuthorizationMessageResponse, DecodeAuthorizationMessageError,
+    GetCallerIdentityRequest, GetCallerIdentityResponse, GetCallerIdentityError,
+    GetFederationTokenRequest, GetFederationTokenResponse, GetFederationTokenError,
+    GetSessionTokenRequest, GetSessionTokenResponse, GetSessionTokenError, Sts,
+    StsClient};
 
 pub const DEFAULT_DURATION_SECONDS: i32 = 3600;
 pub const DEFAULT_ROLE_DURATION_SECONDS: i32 = 900;
@@ -27,16 +29,16 @@ impl NewAwsCredsForStsCreds for AwsCredentials {
         let expires_at = try!(sts_creds.expiration.parse::<DateTime<Utc>>().map_err(CredentialsError::from));
 
         Ok(AwsCredentials::new(
-            sts_creds.access_key_id,
-            sts_creds.secret_access_key,
-            Some(sts_creds.session_token),
+            sts_creds.access_key_id, 
+            sts_creds.secret_access_key, 
+            Some(sts_creds.session_token), 
             expires_at))
     }
 }
 
 // Trait that defines the STS Client API without any type parameters or assumptions about implementation.
 // This is an internal type used to box the [StsClient](struct.StsClient.html) provided in the session token providers' constructors.
-pub trait StsSessionCredentialsClient {
+pub trait StsSessionCredentialsClient: Sized {
     fn assume_role(&self, input: &AssumeRoleRequest) -> Result<AssumeRoleResponse, AssumeRoleError>;
 
     fn assume_role_with_saml(&self, input: &AssumeRoleWithSAMLRequest) -> Result<AssumeRoleWithSAMLResponse, AssumeRoleWithSAMLError>;
@@ -82,30 +84,117 @@ impl<T> StsSessionCredentialsClient for T where T: Sts {
     }
 }
 
+//impl<T> Sts for Box<T> where T: StsSessionCredentialsClient {
+//    fn assume_role(&self, input: &AssumeRoleRequest) -> Result<AssumeRoleResponse, AssumeRoleError> {
+//        self.assume_role()
+//    }
+//
+//    fn assume_role_with_saml(&self, input: &AssumeRoleWithSAMLRequest) -> Result<AssumeRoleWithSAMLResponse, AssumeRoleWithSAMLError> {
+//        self.assume_role_with_saml(input)
+//    }
+//
+//    fn assume_role_with_web_identity(&self, input: &AssumeRoleWithWebIdentityRequest) -> Result<AssumeRoleWithWebIdentityResponse, AssumeRoleWithWebIdentityError> {
+//        self.assume_role_with_web_identity(input)
+//    }
+//
+//    fn decode_authorization_message(&self, input: &DecodeAuthorizationMessageRequest) -> Result<DecodeAuthorizationMessageResponse, DecodeAuthorizationMessageError> {
+//        self.decode_authorization_message(input)
+//    }
+//
+//    fn get_caller_identity(&self, input: &GetCallerIdentityRequest) -> Result<GetCallerIdentityResponse, GetCallerIdentityError> {
+//        self.get_caller_identity(input)
+//    }
+//
+//    fn get_federation_token(&self, input: &GetFederationTokenRequest) -> Result<GetFederationTokenResponse, GetFederationTokenError> {
+//        self.get_federation_token(input)
+//    }
+//
+//    fn get_session_token(&self, input: &GetSessionTokenRequest) -> Result<GetSessionTokenResponse, GetSessionTokenError> {
+//        self.get_session_token(input)
+//    }
+//}
+
 /// [AwsCredentials](../rusoto_credential/struct.AwsCredentials.html) provider that calls
 /// `GetSessionToken` using the provided [StsClient](struct.StsClient.html).
 /// To use with MFA, pass in the MFA serial number then set the MFA code.
 /// You will need to ensure the provider has a valid code each time you
 /// acquire a new STS token.
-pub struct StsSessionCredentialsProvider<C: StsSessionCredentialsClient> {
-    sts_client: C,
-    session_duration: Duration,
-    mfa_serial: Option<String>,
-    mfa_code: Option<String>,
+pub struct StsSessionCredentialsProvider {
+    base: Box<StsSessionCredentialsProviderBase<Box<StsSessionCredentialsClient>>>,
 }
 
-impl<C: StsSessionCredentialsClient> StsSessionCredentialsProvider<C> {
+impl StsSessionCredentialsProvider {
     /// Creates a new `StsSessionCredentialsProvider` with the given
     /// [StsClient](struct.StsClient.html) and session parameters.
     ///
     /// * `sts_client` - The [StsClient](struct.StsClient.html) to use to acquire session tokens.
     /// * `duration` - The duration of the session tokens. Default 1 hour.
     /// * `mfa_serial` - Optional MFA hardware device serial number or virtual device ARN. Set the MFA code with `set_mfa_code`.
-    pub fn new(sts_client: C,
+    pub fn new<P,D>(
+            sts_client: StsClient<P,D>,
+            duration: Option<Duration>,
+            mfa_serial: Option<String>,
+            ) -> StsSessionCredentialsProvider
+            where P: ProvideAwsCredentials + 'static, D: DispatchSignedRequest + 'static {
+        StsSessionCredentialsProvider {
+            base: Box::new(StsSessionCredentialsProviderBase::new(
+                Box::new(sts_client),
+                duration,
+                mfa_serial,
+            )),
+        }
+    }
+
+    /// Set the MFA code for use when acquiring session tokens.
+    pub fn set_mfa_code<S>(&mut self, code: S) where S: Into<String> {
+        self.base.set_mfa_code(code);
+    }
+
+    /// Clear the MFA code.
+    pub fn clear_mfa_code(&mut self) {
+        self.base.clear_mfa_code();
+    }
+
+    /// Calls `GetSessionToken` to get a session token from the STS Api.
+    /// Optionally uses MFA if the MFA serial number and code are set.
+    pub fn get_session_token(&self) -> Result<AwsCredentials, CredentialsError> {
+        self.base.get_session_token()
+    }
+}
+
+impl ProvideAwsCredentials for StsSessionCredentialsProvider {
+    fn credentials(&self) -> Result<AwsCredentials, CredentialsError> {
+        self.base.credentials()
+    }
+}
+
+/// This is the base class for creating a StsSessionCredentialsProvider.
+///
+/// [AwsCredentials](../rusoto_credential/struct.AwsCredentials.html) provider that calls
+/// `GetSessionToken` using the provided [StsClient](struct.StsClient.html).
+/// To use with MFA, pass in the MFA serial number then set the MFA code.
+/// You will need to ensure the provider has a valid code each time you
+/// acquire a new STS token.
+pub struct StsSessionCredentialsProviderBase<C: StsSessionCredentialsClient> {
+    sts_client: C,
+    session_duration: Duration,
+    mfa_serial: Option<String>,
+    mfa_code: Option<String>,
+}
+
+impl<C: StsSessionCredentialsClient> StsSessionCredentialsProviderBase<C> {
+    /// Creates a new `StsSessionCredentialsProviderBase` with the given
+    /// [StsClient](struct.StsClient.html) and session parameters.
+    ///
+    /// * `sts_client` - The [StsClient](struct.StsClient.html) to use to acquire session tokens.
+    /// * `duration` - The duration of the session tokens. Default 1 hour.
+    /// * `mfa_serial` - Optional MFA hardware device serial number or virtual device ARN. Set the MFA code with `set_mfa_code`.
+    pub fn new(
+               sts_client: C,
                duration: Option<Duration>,
                mfa_serial: Option<String>,
-    ) -> StsSessionCredentialsProvider<C> {
-        StsSessionCredentialsProvider {
+    ) -> StsSessionCredentialsProviderBase<C> {
+        StsSessionCredentialsProviderBase {
             sts_client,
             session_duration: duration.unwrap_or(Duration::seconds(DEFAULT_DURATION_SECONDS as i64)),
             mfa_serial: mfa_serial,
@@ -144,7 +233,7 @@ impl<C: StsSessionCredentialsClient> StsSessionCredentialsProvider<C> {
     }
 }
 
-impl<C: StsSessionCredentialsClient> ProvideAwsCredentials for StsSessionCredentialsProvider<C> {
+impl<C: StsSessionCredentialsClient> ProvideAwsCredentials for StsSessionCredentialsProviderBase<C> {
     fn credentials(&self) -> Result<AwsCredentials, CredentialsError> {
         self.get_session_token()
     }
@@ -177,7 +266,8 @@ impl<C: StsSessionCredentialsClient> StsAssumeRoleSessionCredentialsProvider<C> 
     /// * `session_duration` - Duration of session tokens. Default 1 hour.
     /// * `scope_down_policy` - Optional inline IAM policy in JSON format to further restrict the access granted to the negotiated session.
     /// * `mfa_serial` - Optional MFA hardware device serial number or virtual device ARN. Use `set_mfa_code` to set the MFA code.
-    pub fn new(sts_client: C,
+    pub fn new(
+               sts_client: C,
                role_arn: String,
                session_name: String,
                external_id: Option<String>,
@@ -261,7 +351,8 @@ impl<C: StsSessionCredentialsClient> StsWebIdentityFederationSessionCredentialsP
     /// * `session_name` - An identifier for the assumed role session. Minimum length of 2. Maximum length of 64. Pattern: `[\w+=,.@-]*`
     /// * `session_duration` - Duration of session tokens. Default 1 hour.
     /// * `scope_down_policy` - Optional inline IAM policy in JSON format to further restrict the access granted to the negotiated session.
-    pub fn new(sts_client: C,
+    pub fn new(
+               sts_client: C,
                wif_token: String,
                wif_provider: Option<String>,
                role_arn: String,
